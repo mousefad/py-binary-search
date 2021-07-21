@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+#
+# Binary Search Tool
+# Copyright (C) 2020, Mouse. This code distributed under the "MIT" license.
+# See LICENSE file for full terms.
+#
+
+import os
+import sys
+import logging
+import mmap
+import re
+
+log = logging.getLogger(__name__)
+global args
+
+
+class RangeExtractor(object):
+    def __init__(self, s):
+        m = re.match("(\d+)-(\d+)$", s)
+        if m:
+            self.min = int(m.group(1))
+            self.max = int(m.group(2)) + 1
+            assert self.min < self.max
+            return
+        m = re.match("(\d+)$", s)
+        if m:
+            self.min = int(m.group(1))
+            self.max = self.min + 1
+            assert self.min < self.max
+            return
+        raise RuntimeError("RangeExtractor: invalid range string %r" % s)
+
+    def __repr__(self):
+        return 'RangeExtractor("%d-%d")' % (self.min, self.max - 1)
+
+    def __call__(self, line):
+        return str(line)[self.min : self.max]
+
+
+class DelimitedFieldExtractor(object):
+    def __init__(self, delimiter, field_num):
+        assert type(delimiter) is str or delimiter is None
+        assert type(field_num) is int and field_num > 0
+        self.delimiter = delimiter
+        self.field_num = field_num - 1
+
+    def __call__(self, line):
+        if self.delimiter is None:
+            fields = str(line).split()
+        else:
+            fields = str(line).split(self.delimiter)
+        return fields[self.field_num]
+
+    def __repr__(self):
+        return "DelimitedFieldExtractor(delimiter=%r, field_num=%r)" % (
+            self.delimiter,
+            self.field_num,
+        )
+
+
+class Line(object):
+    def __init__(self, start, end, data):
+        self.start = start
+        self.end = end
+        self.data = data
+
+    def __str__(self):
+        return self.data.decode()
+
+    def __repr__(self):
+        return "Line(start=%r, end=%r, data=%r)" % (self.start, self.end, self.data)
+
+
+class BinaryFileSearcher(object):
+    def __init__(self, path, key_extractor):
+        assert callable(key_extractor), "the key_extractor parameter must be callable"
+        self.nl = ord("\n")
+        self.sz = os.path.getsize(path)
+        self.fo = open(path, "r")
+        log.debug("opened %s" % path)
+        self.mm = mmap.mmap(self.fo.fileno(), length=0, access=mmap.ACCESS_READ)
+        self.key_extractor = key_extractor
+
+    def __del__(self):
+        self.mm.close()
+        self.fo.close()
+        log.debug("closed %s" % self.fo.name)
+
+    def line_start(self, offset):
+        assert offset < self.sz
+        for i in range(offset, -2, -1):
+            if self.mm[i - 1] == self.nl:
+                break
+        return i
+
+    def line_end(self, offset):
+        assert offset < self.sz
+        for i in range(offset, self.sz - 1):
+            if self.mm[i + 1] == self.nl:
+                break
+        if i >= self.sz - 1:
+            return self.sz
+        else:
+            return i + 2
+
+    def line(self, offset):
+        """return the line that contains the specified offset as a Line"""
+        start = self.line_start(offset)
+        end = self.line_end(start)
+        return Line(start, end, self.mm[start:end])
+
+    def find(self, key, start=0, end=None, prev=None, depth=0):
+        """return array a lines that match key"""
+        assert depth < 100, "too many recursions... this is silly"
+        if prev is not None and prev == (start, end):
+            raise RuntimeError("not found")
+        if end is None:
+            end = self.sz
+        offset = int(start + ((end - start) / 2))
+        line = self.line(offset)
+        value = self.key_extractor(line)
+        match = self.comparitor(key, value)
+        log.debug(
+            "%s@%d value=%r match=%r depth=%d"
+            % (self.fo.name, offset, value, match, depth)
+        )
+        if match == 0:
+            return self.extract_lines(key, offset)
+        elif match < 0:
+            return self.find(key, offset, end, (start, end), depth + 1)
+        else:
+            return self.find(key, start, offset, (start, end), depth + 1)
+        return list()
+
+    def comparitor(self, a, b):
+        if a == b:
+            return 0
+        elif a < b:
+            return 1
+        else:
+            return -1
+
+    def extract_lines(self, key, offset):
+        """get lines around specified offset that match key as an array of Line"""
+        lines = list()
+        line = self.line(offset)
+        while line.start > 0 and self.comparitor(key, self.key_extractor(line)) == 0:
+            lines.append(line)
+            line = self.line(line.start - 1)
+
+        line = self.line(offset)
+        while line.end < self.sz - 1:
+            line = self.line(line.end + 1)
+            if self.comparitor(key, self.key_extractor(line)) != 0:
+                break
+            lines.append(line)
+        return sorted(lines, key=lambda x: x.start)
+
+
+def main():
+    if args.column:
+        xt = RangeExtractor(args.column)
+    else:
+        xt = DelimitedFieldExtractor(args.delimiter, args.field)
+
+    found = 0
+    for path in args.path:
+        searcher = BinaryFileSearcher(path, xt)
+        log.debug(
+            "searching for %r in %r with key extractor: %r"
+            % (args.key, path, searcher.key_extractor)
+        )
+        try:
+            for line in searcher.find(args.key):
+                if len(args.path) > 1 and not args.hide_path:
+                    sys.stdout.write("%s:%s" % (path, line))
+                else:
+                    sys.stdout.write(str(line))
+                found += 1
+        except RuntimeError as e:
+            log.debug(str(e))
+            pass
+        except MemoryError as e:
+            log.error("%s (file too big?)" % str(e))
+
+    if found == 0:
+        exit(1)
+    else:
+        exit(0)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    global args
+    parser = argparse.ArgumentParser(
+        description="Binary search a sorted file by some key field",
+        epilog=(
+            "Large files that are sorted can be efficiently searched for "
+            "matching values using the binary search method. This program "
+            "uses a recursive method to perform binary search. Key "
+            "field extraction is may be done using a delimiter and field number "
+            "or with a fixed column range within a record."
+        ),
+    )
+
+    parser.add_argument(
+        "--column", "-c", type=str, help="specify column range to use as key"
+    )
+    parser.add_argument(
+        "--debug",
+        dest="logging_level",
+        action="store_const",
+        const=logging.DEBUG,
+        default=logging.INFO,
+        help="write debugging output in the log",
+    )
+    parser.add_argument("--delimiter", "-d", type=str, help="specify field delimiter")
+    parser.add_argument(
+        "--hide-path",
+        "-H",
+        action="store_true",
+        help="If multiple input files are specfied, do not previx lines with file names",
+    )
+    parser.add_argument(
+        "--field",
+        "-f",
+        type=int,
+        default=1,
+        help="specify which delimited field number to use as the key",
+    )
+    parser.add_argument(
+        "--quiet",
+        dest="logging_level",
+        action="store_const",
+        const=logging.WARNING,
+        help="write less output in the log (warnings & errors only)",
+    )
+    parser.add_argument("key", type=str, help="key to search for")
+    parser.add_argument("path", nargs="+", type=str, help="path(s) to search")
+    args = parser.parse_args()
+
+    try:
+        import coloredlogs
+
+        log_fmt = "%(asctime)s,%(msecs)03d %(programname)s[%(process)d] %(levelname)s: %(message)s"
+        coloredlogs.install(level=args.logging_level, fmt=log_fmt, logger=log)
+    except:
+        log_fmt = "%%(asctime)s %s[%%(process)d] %%(levelname)s: %%(message)s" % (
+            os.path.basename(sys.argv[0])
+        )
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(log_fmt))
+        log.setLevel(args.logging_level)
+        log.addHandler(handler)
+
+    main()
